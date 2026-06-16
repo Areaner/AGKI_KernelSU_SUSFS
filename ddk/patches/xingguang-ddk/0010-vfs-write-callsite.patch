@@ -37,3 +37,4 @@ index 1fa7f39c782e..6c6409d47321 100644
 +		ret = xg_ddk_vfs_iter_write(file, iter, &iocb->ki_pos);
  	if (ret < 0)
  		return ret;
+ 
