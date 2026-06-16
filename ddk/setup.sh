@@ -1,462 +1,688 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <libgen.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <limits.h>
-#include <regex.h>
+#!/bin/sh
+set -eu
 
-#define MAX_PATH 4096
-#define MAX_BUFFER 8192
-#define ERROR_DIR_NOT_FOUND 127
-#define ERROR_GENERAL 1
+GKI_ROOT="$(pwd)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+SRC_DIR="$SCRIPT_DIR/xingguang-ddk"
+PATCH_DIR="$SCRIPT_DIR/patches/xingguang-ddk"
+DDK_DIR="$GKI_ROOT/Xingguang-DDK"
 
-typedef struct {
-    char gki_root[MAX_PATH];
-    char script_dir[MAX_PATH];
-    char src_dir[MAX_PATH];
-    char patch_dir[MAX_PATH];
-    char ddk_dir[MAX_PATH];
-    char common_root[MAX_PATH];
-    char security_dir[MAX_PATH];
-    char security_makefile[MAX_PATH];
-    char security_kconfig[MAX_PATH];
-    char ddk_symlink[MAX_PATH];
-} DDKConfig;
+if [ -d "$GKI_ROOT/security" ]; then
+	COMMON_ROOT="$GKI_ROOT"
+	SECURITY_DIR="$GKI_ROOT/security"
+elif [ -d "$GKI_ROOT/common/security" ]; then
+	COMMON_ROOT="$GKI_ROOT/common"
+	SECURITY_DIR="$GKI_ROOT/common/security"
+else
+	echo '[ERROR] security directory not found.'
+	exit 127
+fi
 
-// Get current working directory
-int get_pwd(char *buffer, size_t size) {
-    if (getcwd(buffer, size) == NULL) {
-        perror("getcwd");
-        return -1;
-    }
-    return 0;
+SECURITY_MAKEFILE="$SECURITY_DIR/Makefile"
+SECURITY_KCONFIG="$SECURITY_DIR/Kconfig"
+DDK_SYMLINK="$SECURITY_DIR/xingguang-ddk"
+
+if [ ! -d "$SRC_DIR" ]; then
+	echo "[ERROR] DDK source directory not found: $SRC_DIR"
+	exit 127
+fi
+
+function_has_call() {
+	file="$1"
+	signature="$2"
+	marker="$3"
+	awk -v signature="$signature" -v marker="$marker" '
+		$0 ~ "^[[:space:]]*" signature "\\(" { in_func=1 }
+		in_func && index($0, marker) { found=1; exit }
+		in_func && /^}/ { exit }
+		END { exit found ? 0 : 1 }
+	' "$file"
 }
 
-// Get script directory
-int get_script_dir(const char *argv0, char *buffer, size_t size) {
-    char path[MAX_PATH];
-    char *dir;
-    
-    if (realpath(argv0, path) == NULL) {
-        perror("realpath");
-        return -1;
-    }
-    
-    dir = dirname(path);
-    if (strlen(dir) >= size) {
-        fprintf(stderr, "Script directory path too long\n");
-        return -1;
-    }
-    
-    strcpy(buffer, dir);
-    return 0;
+function_has_call_name() {
+	file="$1"
+	name="$2"
+	marker="$3"
+	awk -v name="$name" -v marker="$marker" '
+		$0 ~ "^[[:space:]]*([_[:alnum:]]+[[:space:]*]+)+" name "[[:space:]]*\\(" { in_func=1 }
+		in_func && index($0, marker) { found=1; exit }
+		in_func && /^}/ { exit }
+		END { exit found ? 0 : 1 }
+	' "$file"
 }
 
-// Check if directory exists
-int dir_exists(const char *path) {
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+inject_function_entry_guard() {
+	file="$1"
+	name="$2"
+	marker="$3"
+	call="$4"
+
+	python3 - "$file" "$name" "$marker" "$call" <<'PY'
+import re
+import sys
+
+path, name, marker, call = sys.argv[1:]
+
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+sig_re = re.compile(
+    r"^\s*(?:[A-Za-z_][\w\s\*]*\s+)+" + re.escape(name) + r"\s*\("
+)
+brace_line = None
+i = 0
+while i < len(lines):
+    if sig_re.search(lines[i]):
+        j = i
+        while j < len(lines):
+            if ";" in lines[j] and "{" not in lines[j]:
+                break
+            if "{" in lines[j]:
+                brace_line = j
+                break
+            j += 1
+        if brace_line is not None:
+            break
+        i = j
+    i += 1
+
+if brace_line is None:
+    raise SystemExit(f"{name} anchor not found")
+
+depth = 0
+end_line = None
+for i in range(brace_line, len(lines)):
+    depth += lines[i].count("{") - lines[i].count("}")
+    if i > brace_line and depth == 0:
+        end_line = i + 1
+        break
+
+if end_line is None:
+    raise SystemExit(f"{name} body end not found")
+
+if marker in "".join(lines[brace_line:end_line]):
+    raise SystemExit(0)
+
+decl_re = re.compile(
+    r"^\s*(?:"
+    r"const\s+|volatile\s+|static\s+|struct\s+|union\s+|enum\s+|"
+    r"unsigned\s+|signed\s+|long\s+|short\s+|int\s+|bool\s+|char\s+|"
+    r"void\s+|size_t\s+|ssize_t\s+|loff_t\s+|sector_t\s+|gfp_t\s+|"
+    r"blk_mode_t\s+|fmode_t\s+|umode_t\s+|u\d+\s+|s\d+\s+|"
+    r"[A-Za-z_]\w*_t\s+|[A-Za-z_]\w+\s+\*"
+    r")"
+)
+
+decl_end = brace_line + 1
+in_decl = False
+in_comment = False
+while decl_end < end_line:
+    stripped = lines[decl_end].strip()
+    if in_comment:
+        if "*/" in stripped:
+            in_comment = False
+        decl_end += 1
+        continue
+    if stripped == "":
+        decl_end += 1
+        continue
+    if stripped.startswith("/*"):
+        if "*/" not in stripped:
+            in_comment = True
+        decl_end += 1
+        continue
+    if in_decl:
+        if ";" in stripped:
+            in_decl = False
+        decl_end += 1
+        continue
+    if decl_re.match(lines[decl_end]):
+        if ";" not in stripped:
+            in_decl = True
+        decl_end += 1
+        continue
+    break
+
+guard = [
+    f"\txg_ddk_ret = {call};\n",
+    "\tif (xg_ddk_ret)\n",
+    "\t\treturn xg_ddk_ret;\n",
+    "\n",
+]
+
+new_lines = (
+    lines[: brace_line + 1]
+    + ["\tint xg_ddk_ret;\n"]
+    + lines[brace_line + 1 : decl_end]
+    + guard
+    + lines[decl_end:]
+)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(new_lines)
+PY
 }
 
-// Check if file exists
-int file_exists(const char *path) {
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISREG(st.st_mode)) ? 1 : 0;
+apply_ddk_0010_compat() {
+	read_write_file="$COMMON_ROOT/fs/read_write.c"
+
+	ensure_ddk_include_after_includes "$read_write_file" || return 1
+
+	python3 - "$read_write_file" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+
+def find_function(name):
+    sig_re = re.compile(
+        r"^\s*(?:[A-Za-z_][\w\s\*]*\s+)+" + re.escape(name) + r"\s*\("
+    )
+    brace_line = None
+    i = 0
+    while i < len(lines):
+        if sig_re.search(lines[i]):
+            j = i
+            while j < len(lines):
+                if ";" in lines[j] and "{" not in lines[j]:
+                    break
+                if "{" in lines[j]:
+                    brace_line = j
+                    break
+                j += 1
+            if brace_line is not None:
+                break
+            i = j
+        i += 1
+
+    if brace_line is None:
+        return None
+
+    depth = 0
+    for i in range(brace_line, len(lines)):
+        depth += lines[i].count("{") - lines[i].count("}")
+        if i > brace_line and depth == 0:
+            return brace_line, i + 1
+    return None
+
+
+def insert_after_rw_verify(name, marker, call):
+    found = find_function(name)
+    if not found:
+        return False
+    brace_line, end_line = found
+    body = "".join(lines[brace_line:end_line])
+    if marker in body:
+        return True
+
+    rw_line = None
+    for i in range(brace_line, end_line):
+        line = lines[i]
+        if "ret = rw_verify_area(WRITE, file," in line:
+            rw_line = i
+            break
+    if rw_line is None:
+        raise SystemExit(f"{name} rw_verify_area write anchor not found")
+
+    insert_at = rw_line + 1
+    while insert_at < end_line and lines[insert_at].strip() == "":
+        insert_at += 1
+    if insert_at < end_line and re.match(r"\s*if\s*\(\s*ret(?:\s*<\s*0)?\s*\)", lines[insert_at]):
+        check_line = insert_at
+        insert_at += 1
+        while insert_at < end_line and lines[insert_at].strip() == "":
+            insert_at += 1
+        if insert_at < end_line and re.match(r"\s*return\s+ret\s*;", lines[insert_at]):
+            insert_at += 1
+        else:
+            insert_at = check_line
+
+    lines[insert_at:insert_at] = [
+        f"\tret = {call};\n",
+        "\tif (ret)\n",
+        "\t\treturn ret;\n",
+        "\n",
+    ]
+    return True
+
+
+if not insert_after_rw_verify(
+    "vfs_write",
+    "xg_ddk_vfs_write(file, buf, count, pos)",
+    "xg_ddk_vfs_write(file, buf, count, pos)",
+):
+    raise SystemExit("vfs_write anchor not found")
+
+iter_hooked = False
+for name, call in (
+    ("do_iter_write", "xg_ddk_vfs_iter_write(file, iter, pos)"),
+    ("vfs_iter_write", "xg_ddk_vfs_iter_write(file, iter, ppos)"),
+):
+    if insert_after_rw_verify(name, call, call):
+        iter_hooked = True
+
+if not iter_hooked:
+    raise SystemExit("iter write anchor not found")
+
+if not insert_after_rw_verify(
+    "vfs_iocb_iter_write",
+    "xg_ddk_vfs_iter_write(file, iter, &iocb->ki_pos)",
+    "xg_ddk_vfs_iter_write(file, iter, &iocb->ki_pos)",
+):
+    raise SystemExit("vfs_iocb_iter_write anchor not found")
+
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
+
+	function_has_call_name "$read_write_file" "vfs_write" "xg_ddk_vfs_write(file, buf, count, pos)" || return 1
+	if ! function_has_call_name "$read_write_file" "do_iter_write" "xg_ddk_vfs_iter_write(file, iter, pos)" &&
+		! function_has_call_name "$read_write_file" "vfs_iter_write" "xg_ddk_vfs_iter_write(file, iter, ppos)"; then
+		return 1
+	fi
+	function_has_call_name "$read_write_file" "vfs_iocb_iter_write" "xg_ddk_vfs_iter_write(file, iter, &iocb->ki_pos)" || return 1
 }
 
-// Initialize configuration
-int init_config(const char *argv0, DDKConfig *config) {
-    if (get_pwd(config->gki_root, MAX_PATH) != 0) {
-        return -1;
-    }
-    
-    if (get_script_dir(argv0, config->script_dir, MAX_PATH) != 0) {
-        return -1;
-    }
-    
-    // Build paths
-    snprintf(config->src_dir, MAX_PATH, "%s/xingguang-ddk", config->script_dir);
-    snprintf(config->patch_dir, MAX_PATH, "%s/patches/xingguang-ddk", config->script_dir);
-    snprintf(config->ddk_dir, MAX_PATH, "%s/Xingguang-DDK", config->gki_root);
-    
-    // Determine security directory
-    char security_test[MAX_PATH];
-    snprintf(security_test, MAX_PATH, "%s/security", config->gki_root);
-    
-    if (dir_exists(security_test)) {
-        strcpy(config->common_root, config->gki_root);
-        snprintf(config->security_dir, MAX_PATH, "%s/security", config->gki_root);
-    } else {
-        snprintf(security_test, MAX_PATH, "%s/common/security", config->gki_root);
-        if (dir_exists(security_test)) {
-            snprintf(config->common_root, MAX_PATH, "%s/common", config->gki_root);
-            snprintf(config->security_dir, MAX_PATH, "%s/common/security", config->gki_root);
-        } else {
-            fprintf(stderr, "[ERROR] security directory not found.\n");
-            return ERROR_DIR_NOT_FOUND;
-        }
-    }
-    
-    snprintf(config->security_makefile, MAX_PATH, "%s/Makefile", config->security_dir);
-    snprintf(config->security_kconfig, MAX_PATH, "%s/Kconfig", config->security_dir);
-    snprintf(config->ddk_symlink, MAX_PATH, "%s/xingguang-ddk", config->security_dir);
-    
-    return 0;
+ensure_ddk_include() {
+	file="$1"
+	include='#include <linux/xingguang_ddk.h>'
+
+	if [ ! -f "$file" ]; then
+		echo "[ERROR] DDK target file not found: $file"
+		return 1
+	fi
+
+	if grep -qF "$include" "$file"; then
+		return 0
+	fi
+
+	if ! grep -q '^#include "blk.h"$' "$file"; then
+		echo "[ERROR] DDK include anchor not found in $file"
+		return 1
+	fi
+
+	sed -i '/^#include "blk.h"$/a\
+#include <linux/xingguang_ddk.h>' "$file"
 }
 
-// Check if file contains a regex pattern
-int file_contains_pattern(const char *filepath, const char *pattern) {
-    FILE *fp;
-    char line[MAX_BUFFER];
-    regex_t regex;
-    int ret = 0;
-    
-    if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
-        fprintf(stderr, "Failed to compile regex: %s\n", pattern);
-        return 0;
-    }
-    
-    fp = fopen(filepath, "r");
-    if (fp == NULL) {
-        regfree(&regex);
-        return 0;
-    }
-    
-    while (fgets(line, sizeof(line), fp) != NULL) {
-        if (regexec(&regex, line, 0, NULL, 0) == 0) {
-            ret = 1;
-            break;
-        }
-    }
-    
-    fclose(fp);
-    regfree(&regex);
-    return ret;
+ensure_ddk_include_after_includes() {
+	file="$1"
+	include='#include <linux/xingguang_ddk.h>'
+
+	if [ ! -f "$file" ]; then
+		echo "[ERROR] DDK target file not found: $file"
+		return 1
+	fi
+
+	if grep -qF "$include" "$file"; then
+		return 0
+	fi
+
+	awk -v inc_line="$include" '
+		{ lines[NR] = $0 }
+		/^#include[[:space:]]+[<"]/ { last_include = NR }
+		END {
+			if (!last_include)
+				exit 1
+			for (i = 1; i <= NR; i++) {
+				print lines[i]
+				if (i == last_include)
+					print inc_line
+			}
+		}
+	' "$file" > "$file.xg-ddk.tmp" && mv "$file.xg-ddk.tmp" "$file" && return 0
+
+	rm -f "$file.xg-ddk.tmp"
+	echo "[ERROR] DDK include anchor not found in $file"
+	return 1
 }
 
-// Read entire file into memory
-char* read_file(const char *filepath, size_t *size) {
-    FILE *fp;
-    char *buffer;
-    size_t file_size;
-    
-    fp = fopen(filepath, "rb");
-    if (fp == NULL) {
-        perror("fopen");
-        return NULL;
-    }
-    
-    fseek(fp, 0, SEEK_END);
-    file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    
-    buffer = malloc(file_size + 1);
-    if (buffer == NULL) {
-        fprintf(stderr, "Memory allocation failed\n");
-        fclose(fp);
-        return NULL;
-    }
-    
-    if (fread(buffer, 1, file_size, fp) != file_size) {
-        fprintf(stderr, "Failed to read file\n");
-        free(buffer);
-        fclose(fp);
-        return NULL;
-    }
-    
-    buffer[file_size] = '\0';
-    *size = file_size;
-    
-    fclose(fp);
-    return buffer;
+inject_ioctl_after_declarations() {
+	file="$1"
+	name="$2"
+
+	python3 - "$file" "$name" <<'PY'
+import re
+import sys
+
+path, name = sys.argv[1:]
+
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+sig_re = re.compile(
+    r"^\s*(?:[A-Za-z_][\w\s\*]*\s+)+" + re.escape(name) + r"\s*\("
+)
+brace_line = None
+i = 0
+while i < len(lines):
+    if sig_re.search(lines[i]):
+        j = i
+        while j < len(lines):
+            if ";" in lines[j] and "{" not in lines[j]:
+                break
+            if "{" in lines[j]:
+                brace_line = j
+                break
+            j += 1
+        if brace_line is not None:
+            break
+        i = j
+    i += 1
+
+if brace_line is None:
+    raise SystemExit(f"{name} anchor not found")
+
+depth = 0
+end_line = None
+for i in range(brace_line, len(lines)):
+    depth += lines[i].count("{") - lines[i].count("}")
+    if i > brace_line and depth == 0:
+        end_line = i + 1
+        break
+
+if end_line is None:
+    raise SystemExit(f"{name} body end not found")
+
+body = "".join(lines[brace_line:end_line])
+if "xg_ddk_blkdev_ioctl(bdev, cmd)" in body:
+    raise SystemExit(0)
+
+decl_re = re.compile(
+    r"^\s*(?:"
+    r"const\s+|volatile\s+|static\s+|struct\s+|union\s+|enum\s+|"
+    r"unsigned\s+|signed\s+|long\s+|short\s+|int\s+|bool\s+|char\s+|"
+    r"void\s+|size_t\s+|ssize_t\s+|loff_t\s+|sector_t\s+|gfp_t\s+|"
+    r"blk_mode_t\s+|fmode_t\s+|umode_t\s+|u\d+\s+|s\d+\s+|"
+    r"[A-Za-z_]\w*_t\s+|[A-Za-z_]\w+\s+\*"
+    r")"
+)
+
+insert_at = brace_line + 1
+in_decl = False
+in_comment = False
+while insert_at < end_line:
+    stripped = lines[insert_at].strip()
+    if in_comment:
+        if "*/" in stripped:
+            in_comment = False
+        insert_at += 1
+        continue
+    if stripped == "":
+        insert_at += 1
+        continue
+    if stripped.startswith("/*"):
+        if "*/" not in stripped:
+            in_comment = True
+        insert_at += 1
+        continue
+    if in_decl:
+        if ";" in stripped:
+            in_decl = False
+        insert_at += 1
+        continue
+    if decl_re.match(lines[insert_at]):
+        if ";" not in stripped:
+            in_decl = True
+        insert_at += 1
+        continue
+    break
+
+lines[insert_at:insert_at] = [
+    "\tret = xg_ddk_blkdev_ioctl(bdev, cmd);\n",
+    "\tif (ret)\n",
+    "\t\treturn ret;\n",
+    "\n",
+]
+
+with open(path, "w", encoding="utf-8") as f:
+    f.writelines(lines)
+PY
 }
 
-// Write buffer to file
-int write_file(const char *filepath, const char *buffer, size_t size) {
-    FILE *fp;
-    
-    fp = fopen(filepath, "wb");
-    if (fp == NULL) {
-        perror("fopen");
-        return -1;
-    }
-    
-    if (fwrite(buffer, 1, size, fp) != size) {
-        fprintf(stderr, "Failed to write file\n");
-        fclose(fp);
-        return -1;
-    }
-    
-    fclose(fp);
-    return 0;
+inject_blkdev_ioctl_compat() {
+	file="$1"
+
+	inject_ioctl_after_declarations "$file" "blkdev_ioctl" && return 0
+	inject_ioctl_after_ret_and_bdev "$file" "blkdev_ioctl" && return 0
+
+	echo "blkdev_ioctl anchor not found"
+	return 1
 }
 
-// Execute system command with error checking
-int exec_git_apply(const char *repo_dir, const char *patch_file, int check_only) {
-    char cmd[MAX_BUFFER * 2];
-    int ret;
-    
-    if (check_only) {
-        snprintf(cmd, sizeof(cmd), "git -C \"%s\" apply --check \"%s\" >/dev/null 2>&1", repo_dir, patch_file);
-    } else {
-        snprintf(cmd, sizeof(cmd), "git -C \"%s\" apply \"%s\"", repo_dir, patch_file);
-    }
-    
-    ret = system(cmd);
-    return ret;
+inject_compat_blkdev_ioctl_compat() {
+	file="$1"
+
+	inject_ioctl_after_declarations "$file" "compat_blkdev_ioctl" && return 0
+	inject_ioctl_after_ret_and_bdev "$file" "compat_blkdev_ioctl" && return 0
+
+	echo "compat_blkdev_ioctl anchor not found"
+	return 1
 }
 
-// Check if patch is already applied (reverse check)
-int patch_already_applied(const char *repo_dir, const char *patch_file) {
-    char cmd[MAX_BUFFER * 2];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" apply --reverse --check \"%s\" >/dev/null 2>&1", repo_dir, patch_file);
-    return (system(cmd) == 0) ? 1 : 0;
+inject_ioctl_after_ret_and_bdev() {
+	file="$1"
+	name="$2"
+	xg_tmp="${file}.xg-ddk.tmp"
+
+	awk -v name="$name" '
+		BEGIN { in_func=0; saw_ret=0; saw_bdev=0; inserted=0 }
+		!in_func && $0 ~ "^[[:space:]]*([_[:alnum:]]+[[:space:]*]+)+" name "[[:space:]]*\\(" {
+			in_func=1
+			saw_ret=0
+			saw_bdev=0
+		}
+		{
+			if (in_func) {
+				if ($0 ~ /^[[:space:]]*int[[:space:]]+ret[[:space:]]*;/) saw_ret=1
+				if ($0 ~ /^[[:space:]]*struct[[:space:]]+block_device[[:space:]]+\*bdev[[:space:]]*=/) saw_bdev=1
+				if (!inserted && saw_ret && saw_bdev &&
+				    $0 ~ /^[[:space:]]*(switch[[:space:]]*\(cmd\)|ret[[:space:]]*=|if[[:space:]]*\(|return[[:space:]])/) {
+					print "\tret = xg_ddk_blkdev_ioctl(bdev, cmd);"
+					print "\tif (ret)"
+					print "\t\treturn ret;"
+					inserted=1
+				}
+				if ($0 ~ /^}/) in_func=0
+			}
+			print
+		}
+		END { exit inserted ? 0 : 1 }
+	' "$file" > "$xg_tmp" && mv "$xg_tmp" "$file" && return 0
+
+	rm -f "$xg_tmp"
+	return 1
 }
 
-// Apply patches from directory
-int apply_patches(const char *patch_dir, const char *common_root) {
-    DIR *dir;
-    struct dirent *entry;
-    char patch_file[MAX_PATH];
-    char patch_name[256];
-    int optional;
-    
-    dir = opendir(patch_dir);
-    if (dir == NULL) {
-        perror("opendir");
-        return -1;
-    }
-    
-    printf("[+] Applying Xingguang DDK patch stack\n");
-    
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_type != DT_REG) continue;
-        if (strstr(entry->d_name, ".patch") == NULL) continue;
-        
-        snprintf(patch_file, MAX_PATH, "%s/%s", patch_dir, entry->d_name);
-        strcpy(patch_name, entry->d_name);
-        
-        optional = (strstr(patch_name, ".optional.patch") != NULL) ? 1 : 0;
-        
-        // Try normal apply
-        if (exec_git_apply(common_root, patch_file, 1) == 0) {
-            exec_git_apply(common_root, patch_file, 0);
-            printf(" - applied %s\n", patch_name);
-            continue;
-        }
-        
-        // Check if already applied
-        if (patch_already_applied(common_root, patch_file)) {
-            printf(" - already applied %s\n", patch_name);
-            continue;
-        }
-        
-        // Handle optional patches
-        if (optional) {
-            printf(" - skipped optional %s\n", patch_name);
-            continue;
-        }
-        
-        // Failed to apply
-        fprintf(stderr, "[ERROR] failed to apply DDK patch: %s\n", patch_file);
-        closedir(dir);
-        return ERROR_GENERAL;
-    }
-    
-    closedir(dir);
-    return 0;
+apply_ddk_0030_compat() {
+	ioctl_file="$COMMON_ROOT/block/ioctl.c"
+	blk_lib_file="$COMMON_ROOT/block/blk-lib.c"
+
+	ensure_ddk_include "$ioctl_file" || return 1
+	ensure_ddk_include "$blk_lib_file" || return 1
+
+	if ! function_has_call_name "$ioctl_file" "blkdev_ioctl" "xg_ddk_blkdev_ioctl(bdev, cmd)"; then
+		inject_blkdev_ioctl_compat "$ioctl_file" || return 1
+	fi
+
+	if ! function_has_call_name "$ioctl_file" "compat_blkdev_ioctl" "xg_ddk_blkdev_ioctl(bdev, cmd)"; then
+		inject_compat_blkdev_ioctl_compat "$ioctl_file" || return 1
+	fi
+
+	if ! function_has_call_name "$blk_lib_file" "__blkdev_issue_discard" "xg_ddk_blkdev_issue_discard(bdev, sector, nr_sects)"; then
+		inject_function_entry_guard \
+			"$blk_lib_file" "__blkdev_issue_discard" \
+			"xg_ddk_blkdev_issue_discard(bdev, sector, nr_sects)" \
+			"xg_ddk_blkdev_issue_discard(bdev, sector, nr_sects)" || return 1
+	fi
+
+	if ! function_has_call_name "$blk_lib_file" "__blkdev_issue_zeroout" "xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)"; then
+		inject_function_entry_guard \
+			"$blk_lib_file" "__blkdev_issue_zeroout" \
+			"xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" \
+			"xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" || return 1
+	fi
+
+	if ! function_has_call_name "$blk_lib_file" "blkdev_issue_zeroout" "xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)"; then
+		inject_function_entry_guard \
+			"$blk_lib_file" "blkdev_issue_zeroout" \
+			"xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" \
+			"xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" || return 1
+	fi
+
+	function_has_call_name "$ioctl_file" "blkdev_ioctl" "xg_ddk_blkdev_ioctl(bdev, cmd)" || return 1
+	function_has_call_name "$ioctl_file" "compat_blkdev_ioctl" "xg_ddk_blkdev_ioctl(bdev, cmd)" || return 1
+	function_has_call_name "$blk_lib_file" "__blkdev_issue_discard" "xg_ddk_blkdev_issue_discard(bdev, sector, nr_sects)" || return 1
+	function_has_call_name "$blk_lib_file" "__blkdev_issue_zeroout" "xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" || return 1
+	function_has_call_name "$blk_lib_file" "blkdev_issue_zeroout" "xg_ddk_blkdev_issue_zeroout(bdev, sector, nr_sects)" || return 1
 }
 
-// Copy directory recursively (simplified version)
-int copy_directory(const char *src, const char *dst) {
-    char cmd[MAX_BUFFER * 2];
-    
-    snprintf(cmd, sizeof(cmd), "cp -a \"%s/.\" \"%s/\"", src, dst);
-    
-    if (system(cmd) != 0) {
-        fprintf(stderr, "[ERROR] Failed to copy directory from %s to %s\n", src, dst);
-        return ERROR_GENERAL;
-    }
-    
-    return 0;
+apply_ddk_0040_compat() {
+	dm_table_file="$COMMON_ROOT/drivers/md/dm-table.c"
+
+	ensure_ddk_include_after_includes "$dm_table_file" || return 1
+
+	if function_has_call_name "$dm_table_file" "dm_table_add_target" "xg_ddk_dm_target_add("; then
+		return 0
+	fi
+
+	python3 - "$dm_table_file" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    lines = f.readlines()
+
+sig_re = re.compile(r"^\s*int\s+dm_table_add_target\s*\(")
+brace_line = None
+i = 0
+while i < len(lines):
+    if sig_re.search(lines[i]):
+        j = i
+        while j < len(lines):
+            if ";" in lines[j] and "{" not in lines[j]:
+                break
+            if "{" in lines[j]:
+                brace_line = j
+                break
+            j += 1
+        if brace_line is not None:
+            break
+        i = j
+    i += 1
+
+if brace_line is None:
+    raise SystemExit("dm_table_add_target anchor not found")
+
+depth = 0
+end_line = None
+for i in range(brace_line, len(lines)):
+    depth += lines[i].count("{") - lines[i].count("}")
+    if i > brace_line and depth == 0:
+        end_line = i + 1
+        break
+
+if end_line is None:
+    raise SystemExit("dm_table_add_target body end not found")
+
+body = "".join(lines[brace_line:end_line])
+if "xg_ddk_dm_target_add(" in body:
+    raise SystemExit(0)
+
+for i in range(brace_line, end_line):
+    line = lines[i]
+    if "t->highs[t->num_targets++]" not in line:
+        continue
+    match = re.search(r"([A-Za-z_]\w*)->begin\s*\+\s*\1->len\s*-\s*1", line)
+    if not match:
+        match = re.search(r"([A-Za-z_]\w*)->begin", line)
+    if not match:
+        continue
+    target_var = match.group(1)
+    lines.insert(i + 1, f"\n\txg_ddk_dm_target_add({target_var}->type->name);\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    raise SystemExit(0)
+
+raise SystemExit("dm_table_add_target highs anchor not found")
+PY
+
+	function_has_call_name "$dm_table_file" "dm_table_add_target" "xg_ddk_dm_target_add(" || return 1
 }
 
-// Remove directory recursively
-int remove_directory(const char *path) {
-    char cmd[MAX_BUFFER];
-    snprintf(cmd, sizeof(cmd), "rm -rf \"%s\"", path);
-    return system(cmd);
-}
+echo "[+] Setting up Xingguang DDK LSM"
 
-// Create symlink
-int create_symlink(const char *target, const char *link_path) {
-    char cmd[MAX_BUFFER * 2];
-    snprintf(cmd, sizeof(cmd), "ln -sfn \"%s\" \"%s\"", target, link_path);
-    return system(cmd);
-}
+if [ -d "$PATCH_DIR" ]; then
+	echo "[+] Applying Xingguang DDK patch stack"
+	for patch in "$PATCH_DIR"/*.patch; do
+		[ -e "$patch" ] || continue
+		patch_name="$(basename "$patch")"
+		optional=false
+		case "$patch_name" in
+			*.optional.patch) optional=true ;;
+		esac
+		if git -C "$COMMON_ROOT" apply --check "$patch" >/dev/null 2>&1; then
+			git -C "$COMMON_ROOT" apply "$patch"
+			echo " - applied $patch_name"
+		elif git -C "$COMMON_ROOT" apply --reverse --check "$patch" >/dev/null 2>&1; then
+			echo " - already applied $patch_name"
+		elif [ "$patch_name" = "0010-vfs-write-callsite.patch" ] && apply_ddk_0010_compat; then
+			echo " - applied $patch_name (compat)"
+		elif [ "$patch_name" = "0030-block-ioctl-erase-callsite.patch" ] && apply_ddk_0030_compat; then
+			echo " - applied $patch_name (compat)"
+		elif [ "$patch_name" = "0040-dm-target-callsite.patch" ] && apply_ddk_0040_compat; then
+			echo " - applied $patch_name (compat)"
+		elif [ "$optional" = true ]; then
+			echo " - skipped optional $patch_name"
+		else
+			echo "[ERROR] failed to apply DDK patch: $patch"
+			git -C "$COMMON_ROOT" apply --check "$patch"
+			exit 1
+		fi
+	done
+fi
 
-// Update Makefile with DDK configuration
-int update_makefile(const char *makefile_path) {
-    char *content;
-    size_t size;
-    char new_content[MAX_BUFFER * 2];
-    
-    if (!file_exists(makefile_path)) {
-        fprintf(stderr, "[ERROR] Makefile not found: %s\n", makefile_path);
-        return -1;
-    }
-    
-    content = read_file(makefile_path, &size);
-    if (content == NULL) {
-        return -1;
-    }
-    
-    if (strstr(content, "xingguang-ddk") == NULL) {
-        snprintf(new_content, sizeof(new_content), "%s\nobj-$(CONFIG_XINGGUANG_DDK) += xingguang-ddk/\n", content);
-        if (write_file(makefile_path, new_content, strlen(new_content)) != 0) {
-            free(content);
-            return -1;
-        }
-        printf(" - Makefile updated\n");
-    }
-    
-    free(content);
-    return 0;
-}
+rm -rf "$DDK_DIR"
+mkdir -p "$DDK_DIR"
+cp -a "$SRC_DIR/." "$DDK_DIR/"
 
-// Update Kconfig with DDK configuration
-int update_kconfig(const char *kconfig_path) {
-    char *content;
-    size_t size;
-    char new_content[MAX_BUFFER * 4];
-    const char *insert_line = "source \"security/xingguang-ddk/Kconfig\"\n";
-    
-    if (!file_exists(kconfig_path)) {
-        fprintf(stderr, "[ERROR] Kconfig not found: %s\n", kconfig_path);
-        return -1;
-    }
-    
-    content = read_file(kconfig_path, &size);
-    if (content == NULL) {
-        return -1;
-    }
-    
-    if (strstr(content, "security/xingguang-ddk/Kconfig") == NULL) {
-        char *endmenu_pos = strstr(content, "\nendmenu");
-        
-        if (endmenu_pos != NULL) {
-            size_t prefix_len = endmenu_pos - content + 1;
-            snprintf(new_content, sizeof(new_content), "%.*s%s%s", 
-                    (int)prefix_len, content, insert_line, endmenu_pos + 1);
-        } else {
-            snprintf(new_content, sizeof(new_content), "%s\n%s", content, insert_line);
-        }
-        
-        if (write_file(kconfig_path, new_content, strlen(new_content)) != 0) {
-            free(content);
-            return -1;
-        }
-        printf(" - Kconfig updated\n");
-    }
-    
-    free(content);
-    return 0;
-}
+cd "$SECURITY_DIR"
+if command -v realpath >/dev/null 2>&1; then
+	rel="$(realpath --relative-to="$SECURITY_DIR" "$DDK_DIR" 2>/dev/null || true)"
+else
+	rel="$DDK_DIR"
+fi
+[ -n "$rel" ] || rel="$DDK_DIR"
+ln -sfn "$rel" "$DDK_SYMLINK"
 
-// Main setup function
-int ddk_setup(const char *argv0) {
-    DDKConfig config;
-    int ret;
-    
-    printf("[+] Setting up Xingguang DDK LSM\n");
-    
-    // Initialize configuration
-    if ((ret = init_config(argv0, &config)) != 0) {
-        return ret;
-    }
-    
-    // Check if source directory exists
-    if (!dir_exists(config.src_dir)) {
-        fprintf(stderr, "[ERROR] DDK source directory not found: %s\n", config.src_dir);
-        return ERROR_DIR_NOT_FOUND;
-    }
-    
-    // Apply patches if patch directory exists
-    if (dir_exists(config.patch_dir)) {
-        if ((ret = apply_patches(config.patch_dir, config.common_root)) != 0) {
-            return ret;
-        }
-    }
-    
-    // Remove old DDK directory and copy new one
-    remove_directory(config.ddk_dir);
-    if (mkdir(config.ddk_dir, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir");
-        return ERROR_GENERAL;
-    }
-    
-    if (copy_directory(config.src_dir, config.ddk_dir) != 0) {
-        return ERROR_GENERAL;
-    }
-    
-    // Create symlink
-    if (chdir(config.security_dir) != 0) {
-        perror("chdir");
-        return ERROR_GENERAL;
-    }
-    
-    char rel_path[MAX_PATH];
-    char cmd[MAX_BUFFER];
-    
-    snprintf(cmd, sizeof(cmd), "realpath --relative-to=\"%s\" \"%s\" 2>/dev/null", 
-             config.security_dir, config.ddk_dir);
-    
-    FILE *fp = popen(cmd, "r");
-    if (fp != NULL) {
-        if (fgets(rel_path, sizeof(rel_path), fp) != NULL) {
-            size_t len = strlen(rel_path);
-            if (len > 0 && rel_path[len-1] == '\n') {
-                rel_path[len-1] = '\0';
-            }
-        }
-        pclose(fp);
-    }
-    
-    if (strlen(rel_path) == 0) {
-        strcpy(rel_path, config.ddk_dir);
-    }
-    
-    if (create_symlink(rel_path, config.ddk_symlink) != 0) {
-        fprintf(stderr, "[ERROR] Failed to create symlink\n");
-        return ERROR_GENERAL;
-    }
-    
-    // Update Makefile and Kconfig
-    if (update_makefile(config.security_makefile) != 0) {
-        return ERROR_GENERAL;
-    }
-    
-    if (update_kconfig(config.security_kconfig) != 0) {
-        return ERROR_GENERAL;
-    }
-    
-    printf("[+] Xingguang DDK LSM ready.\n");
-    
-    return 0;
-}
+if ! grep -q 'xingguang-ddk' "$SECURITY_MAKEFILE"; then
+	printf '\nobj-$(CONFIG_XINGGUANG_DDK) += xingguang-ddk/\n' >> "$SECURITY_MAKEFILE"
+	echo " - Makefile updated"
+fi
 
-int main(int argc, char *argv[]) {
-    int ret;
-    
-    if (argc < 1) {
-        fprintf(stderr, "Usage: %s\n", argv[0]);
-        return ERROR_GENERAL;
-    }
-    
-    ret = ddk_setup(argv[0]);
-    
-    return ret;
-}
+if ! grep -q 'security/xingguang-ddk/Kconfig' "$SECURITY_KCONFIG"; then
+	if grep -n '^endmenu[[:space:]]*$' "$SECURITY_KCONFIG" >/dev/null 2>&1; then
+		awk '
+			{ a[NR]=$0 }
+			END {
+				last=0
+				for (i=1; i<=NR; i++) if (a[i] ~ /^endmenu[[:space:]]*$/) last=i
+				for (i=1; i<=NR; i++) {
+					if (i==last) print "source \"security/xingguang-ddk/Kconfig\""
+					print a[i]
+				}
+			}
+		' "$SECURITY_KCONFIG" > "$SECURITY_KCONFIG.tmp" && mv "$SECURITY_KCONFIG.tmp" "$SECURITY_KCONFIG"
+	else
+		printf '\nsource "security/xingguang-ddk/Kconfig"\n' >> "$SECURITY_KCONFIG"
+	fi
+	echo " - Kconfig updated"
+fi
+
+sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /xingguang_ddk/! s/selinux/selinux,xingguang_ddk/ } }' "$SECURITY_KCONFIG"
+
+echo "[+] Xingguang DDK LSM ready."
