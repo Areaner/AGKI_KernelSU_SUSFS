@@ -104,6 +104,10 @@ on:
         description: "启用 Re-Kernel 驱动"
         type: boolean
         default: false
+      cve_2026_43499_patch:
+        description: "应用 CVE-2026-43499 rtmutex 修复链"
+        type: boolean
+        default: false
       cancel_susfs:
         description: "禁用 SUSFS"
         type: boolean
@@ -168,6 +172,7 @@ jobs:
       use_bbg: ${{ inputs.use_bbg }}
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: "上传全部"
@@ -187,6 +192,7 @@ jobs:
       use_bbg: ${{ inputs.use_bbg }}
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: "上传全部"
@@ -206,6 +212,7 @@ jobs:
       use_bbg: ${{ inputs.use_bbg }}
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: "上传全部"
@@ -225,6 +232,7 @@ jobs:
       use_bbg: ${{ inputs.use_bbg }}
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: "上传全部"
@@ -244,6 +252,7 @@ jobs:
       use_bbg: ${{ inputs.use_bbg }}
       use_kpm: ${{ inputs.use_kpm }}
       use_rekernel: ${{ inputs.use_rekernel }}
+      cve_2026_43499_patch: ${{ inputs.cve_2026_43499_patch }}
       cancel_susfs: ${{ inputs.cancel_susfs }}
       droidspaces: ${{ inputs.droidspaces }}
       artifact_upload_mode: "上传全部"
@@ -381,7 +390,7 @@ jobs:
 
       # ==================== 检出代码 ====================
       - name: 检出代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
 
